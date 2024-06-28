@@ -1,0 +1,160 @@
+from pyspark.ml.feature import VectorAssembler , OneHotEncoder
+from pyspark.ml.feature import StringIndexer
+from pyspark.ml.classification import GBTClassifier
+
+features = list(df_train.columns)
+inputs = [col for col in features if col not in ['target_flag']]
+assembler = VectorAssembler(inputCols=inputs,outputCol='Features')
+df_train_data = assembler.transform(df_train)
+final_train_data = df_train_data['Features','target_flag']
+
+gbr = GBTClassifier(labelCol='target_flag',featuresCol='Features',maxIter=70,maxDepth=6,minInstancesPerNode=600000,
+                    featureSubStrategy='sqrt',stepSize=1)
+
+model = gbr.fit(final_train_data)
+model.save('/das/coe/hsh/......')
+
+from pyspark.ml.classification import GBTClassificationModel
+
+loaded_model = GBTClassificationModel.load('......')
+
+predictions = loaded_model.transform(final_train_data)
+
+predictions_train = predictions.select(*['probablity','target_flag','prediction','snapshot'])
+
+from pyspark.sql.functions import udf
+
+def get_last(x):
+    return float(x[1])
+
+get_last_udf = udf(get_last, DoubleType())
+
+predictions_train.persist()
+
+predictions_train2 = predictions_train.withColumn('event_prob',get_last_udf(predictions_train['probability']))
+predictions_train4 = predictions_train2.select(*['event_prob','target_flag','snapshot'])
+predictions_train4.registerTempTable('predictions_train4')
+train_count = df_train.count()
+
+train_cnt = np.ceil(train_count/10)
+
+train_buckets_dist = sqlContext.sql(f"""
+select a.*,
+cast(a.rank/{train_cnt} as bigint)+1 as bucket
+from
+(
+select *,row_number() over(order by event_prob desc) as rank
+from predictions_train4
+) a
+""")
+
+train_buckets_dist.registerTempTable('train_bucket_dist')
+train_buckets_group = sqlContext.sql("""
+select bucket,
+min(event_prob) as min_prob,
+max(event_prob) as max_prob
+from train_bucket_dist
+group by bucket
+order by bucket
+""")
+
+train_buckets_group.registerTempTable('train_buckets_group')
+minimum_prob, maximum_prob = train_buckets_group.filter('bucket=10').select('min_prob').collect()[0][0],train_buckets_group.filter('bucket=10').select('max_prob').collect()[0][0]
+
+final_train_dist = sqlContext.sql("""select
+b.bucket,
+b.snapshot,
+count(b.rank) as counts,
+sum(b.target_flag) as events
+from train_bucket_dist b
+group by 1,2
+""")
+
+final_train_dist.count()
+final_train_dist.persist()
+final_train_dist.registerTempTable('final_train_dist')
+
+final_train_dist2 = sqlContext.sql("""select
+a.bucket,
+b.snapshot,
+a.min_prob,
+a.max_prob,
+b.counts,
+b.events
+from train_buckets_group a inner join final_train_dist b
+on a.bucket = b.bucket
+""")
+
+final_train_dist2.count()
+final_train_dist2.persist()
+final_train_dist2.registerTempTable('final_train_dist2')
+
+df_test_data = assembler.transform(df_test)
+final_test_data = df_test_data['Features','target_flag']
+predictions = loaded_model.transform(final_test_data)
+
+predictions_test = predictions.select(*['probability','target_flag','prediction','snapshot'])
+predictions_test2 = predictions_test.withColumn('event_prob',get_last_udf(predictions_test['probability']))
+predictions_test4 = predictions_test2.select(*['event_prob','target_flag','snapshot'])
+predictions_test4.registerTempTable('predictions_test4')
+
+test_bucket_ranks = sqlContext.sql("""select *, row_number() over(order by event_prob desc) as rank
+from predictions_test4
+""")
+
+test_bucket_ranks.registerTempTable('test_bucket_ranks')
+test_to_train_bucket_matching = sqlContext.sql(f"""
+select x.rank , y.event_prob , y.target_flag, y.snapshot,
+case when x.train_bucket is not null then x.train_bucket
+when y.event_prob <= {minimum_prob} then 10
+end as train_bucket
+from
+(
+select a.rank,
+min(b.bucket) as train_bucket
+from test_bucket_ranks a left join train_buckets_group b
+on a.event_prob >= b.min_prob
+group by 1
+) x inner join test_bucket_ranks y
+on x.rank = y.rank
+""")
+
+
+test_to_train_bucket_matching.count()
+test_to_train_bucket_matching.persist()
+
+test_to_train_bucket_matching.registerTempTable('test_to_train_bucket_matching')
+
+test_to_train_bucket_groups = sqlContext.sql("""select 
+train_bucket,
+snapshot,
+count(rank) as counts,
+sum(target_flag) as events
+from test_to_train_bucket_matching
+group by 1,2
+""")
+
+test_to_train_bucket_groups.registerTempTable('test_to_train_bucket_groups')
+final_results_p1 = sqlContext.sql("""
+select a.bucket,
+a.snapshot,
+a.min_prob,
+a.max_prob,
+a.counts as count_train,
+a.events as events_train,
+b.counts as count_test,
+b.events as events_test
+from final_train_dist2 a left join test_to_train_bucket_groups b
+on a.bucket = b.train_bucket
+and a.snapshot = b.snapshot
+""")
+
+final_results_p1.count()
+final_results_p1.persist()
+final_results_p1.toPandas().to_excel('GB Results.xlsx',index=False)
+
+gbt_feature_importance = pd.DataFrame({'Variable': Inputs, 'Importance': list(loaded_model.featureImportances)})
+gbt_feature_importance.to_excel('GB_feature_importance.xlsx',index=False)
+spark.stop()
+
+
